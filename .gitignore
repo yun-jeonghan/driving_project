@@ -1,0 +1,11 @@
+# 아직 생성 전이라도 미리 적어두면 안전합니다.
+# 모든 로그 파일 무시
+*.log
+# 가상환경 폴더 무시
+.venv/
+# 파이썬 컴파일 캐시 폴더 무시
+__pycache__/
+# FastVGGT Repo 관련
+FastVGGT_repo/
+models/
+data/
