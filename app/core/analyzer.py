@@ -233,7 +233,7 @@ class DrivingAnalyzer:
 
                 # 리스크 점수 (속도가 음수면 멀어지는 것이므로 0 처리)
                 risk = round((10.0 / (curr_dist + 1e-6)) + (max(0, velocity) * 0.7), 4)
-                alert = "DANGER" if risk >= 2.0 else "WARNING" if risk >= 1.0 else "NORMAL"
+                alert = "DANGER" if risk >= 20.0 else "WARNING" if risk >= 10.0 else "NORMAL"
 
                 frame_report.append({
                     "id": int(obj_id),
