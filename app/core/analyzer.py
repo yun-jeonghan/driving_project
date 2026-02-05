@@ -171,58 +171,51 @@ class DrivingAnalyzer:
         self.history[obj_id] = {'dist': current_dist, 'time': current_time}
         return velocity
     
-    def analyze_video_frame(self, frame, timestamp):
-        """
-        frame: 현재 영상 프레임 (numpy array)
-        timestamp: 현재 프레임의 시간 (sec 단위, 예: cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
-        """
-        # 1. YOLO 추적 (persist=True를 해야 이전 프레임의 ID가 유지됩니다)
+def analyze_video_frame(self, frame, timestamp):
+        # 1. YOLO 추적 (persist=True)
         results = self.detector.track(frame, persist=True, verbose=False)[0]
-        
-        # 2. Depth Map 생성
         depth_map = self._get_depth_map(frame)
         depth_map_resized = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
 
         frame_report = []
 
-        # YOLO가 탐지한 객체들 순회
-        if results.boxes.id is not None:
+        # [수정 포인트] results.boxes.id가 없더라도 boxes 자체는 존재할 수 있음
+        if results.boxes is not None:
             boxes = results.boxes.xyxy.cpu().numpy()
-            ids = results.boxes.id.cpu().numpy().astype(int)
             clss = results.boxes.cls.cpu().numpy().astype(int)
+            
+            # ID가 있는 경우만 가져오고, 없으면 None으로 채움
+            ids = results.boxes.id.cpu().numpy().astype(int) if results.boxes.id is not None else [None] * len(boxes)
 
             for box, obj_id, cls in zip(boxes, ids, clss):
                 x1, y1, x2, y2 = map(int, box)
                 label = self.detector.names[cls]
 
-                # ROI 영역의 평균 거리(m) 추출
+                # 거리 계산
                 roi_depth = depth_map_resized[y1:y2, x1:x2]
                 curr_dist = np.mean(roi_depth) if roi_depth.size > 0 else 50.0
 
-                # 3. 상대 속도 계산 (m/s)
+                # 상대 속도 계산 (ID가 있을 때만 수행)
                 velocity = 0.0
-                if obj_id in self.history:
+                if obj_id is not None and obj_id in self.history:
                     prev_data = self.history[obj_id]
-                    delta_d = prev_data['dist'] - curr_dist # 양수면 가까워지는 중
+                    delta_d = prev_data['dist'] - curr_dist
                     delta_t = timestamp - prev_data['time']
-                    
                     if delta_t > 0:
                         velocity = delta_d / delta_t
                 
-                # 히스토리 업데이트 (다음 프레임을 위해)
-                self.history[obj_id] = {'dist': curr_dist, 'time': timestamp}
+                # 히스토리 업데이트 (ID가 있을 때만)
+                if obj_id is not None:
+                    self.history[obj_id] = {'dist': curr_dist, 'time': timestamp}
 
-                # 4. 리스크 점수 산출 (거리 + 접근 속도 반영)
-                # 다가오는 속도가 빠를수록 리스크 가중치 부여
+                # 리스크 점수 (ID 없어도 거리 기반으로 기본 산출)
                 risk = round((10.0 / (curr_dist + 1e-6)) + (max(0, velocity) * 0.7), 4)
-
-                # 5. 경보 등급 결정
                 alert = "NORMAL"
                 if risk >= 2.0: alert = "DANGER"
                 elif risk >= 1.0: alert = "WARNING"
 
                 frame_report.append({
-                    "id": int(obj_id),
+                    "id": int(obj_id) if obj_id is not None else "New", # ID 없으면 New로 표시
                     "label": label,
                     "dist_m": round(float(curr_dist), 2),
                     "velocity_mps": round(float(velocity), 2),
