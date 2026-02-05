@@ -171,7 +171,7 @@ class DrivingAnalyzer:
         self.history[obj_id] = {'dist': current_dist, 'time': current_time}
         return velocity
     
-def analyze_video_frame(self, frame, timestamp):
+    def analyze_video_frame(self, frame, timestamp):
         # 1. YOLO 추적 (persist=True)
         results = self.detector.track(frame, persist=True, verbose=False)[0]
         depth_map = self._get_depth_map(frame)
