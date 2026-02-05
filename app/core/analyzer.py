@@ -172,49 +172,68 @@ class DrivingAnalyzer:
         return velocity
     
     def analyze_video_frame(self, frame, timestamp):
-        # 1. YOLO 추적 (persist=True는 필수입니다)
-        # 만약 프레임 간격이 너무 크면 트래커가 놓칠 수 있으니 주의하세요.
+        # 1. 일단 탐지(Detection)를 먼저 수행합니다. (트래킹에만 의존 X)
         results = self.detector.track(frame, persist=True, verbose=False)[0]
         
         depth_map = self._get_depth_map(frame)
         depth_map_resized = cv2.resize(depth_map, (frame.shape[1], frame.shape[0]))
-
         frame_report = []
 
-        # 객체가 하나도 없을 때를 위한 방어 코드
-        if results.boxes is not None and results.boxes.id is not None:
+        if results.boxes is not None:
             boxes = results.boxes.xyxy.cpu().numpy()
-            ids = results.boxes.id.cpu().numpy().astype(int)
             clss = results.boxes.cls.cpu().numpy().astype(int)
+            # YOLO가 준 ID가 있으면 쓰고, 없으면 -1로 둡니다.
+            ids = results.boxes.id.cpu().numpy().astype(int) if results.boxes.id is not None else [-1] * len(boxes)
 
-            for box, obj_id, cls in zip(boxes, ids, clss):
+            for i, (box, obj_id, cls) in enumerate(zip(boxes, ids, clss)):
                 x1, y1, x2, y2 = map(int, box)
                 label = self.detector.names[cls]
+                center_now = ((x1 + x2) / 2, (y1 + y2) / 2)
 
-                # 거리 계산
+                # [핵심] 1초 간격 대응 강제 매칭 로직
+                # YOLO가 ID를 못 줬거나(-1), 새로 부여했더라도 우리가 히스토리와 대조합니다.
+                best_match_id = obj_id
+                min_dist = 200 # 1초 동안 이동 가능한 픽셀 거리 (화면 크기에 따라 조절)
+
+                for old_id, old_data in self.history.items():
+                    if old_data['label'] == label:
+                        # 유클리드 거리 계산
+                        dist = np.linalg.norm(np.array(center_now) - np.array(old_data['center']))
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_match_id = old_id
+                
+                # 최종 결정된 ID (새로 나타난 놈이면 새로운 고유 ID 부여)
+                if best_match_id == -1:
+                    # 히스토리에 없는 완전히 새로운 객체라면 현재 루프에서 가장 큰 ID + 1 부여
+                    new_id = max(self.history.keys()) + 1 if self.history else 1
+                    obj_id = new_id
+                else:
+                    obj_id = best_match_id
+
+                # 거리 및 속도 계산
                 roi_depth = depth_map_resized[y1:y2, x1:x2]
                 curr_dist = np.mean(roi_depth) if roi_depth.size > 0 else 50.0
 
-                # [핵심] 상대 속도 계산 (ID가 부여된 모든 객체 대상)
                 velocity = 0.0
                 if obj_id in self.history:
                     prev_data = self.history[obj_id]
-                    delta_d = prev_data['dist'] - curr_dist # 가까워지면 (+)
+                    delta_d = prev_data['dist'] - curr_dist
                     delta_t = timestamp - prev_data['time']
-                    
                     if delta_t > 0:
                         velocity = delta_d / delta_t
                 
-                # 히스토리 업데이트 (이게 있어야 다음 프레임에서 속도를 계산합니다)
-                self.history[obj_id] = {'dist': curr_dist, 'time': timestamp}
+                # 히스토리 업데이트 (다음 프레임을 위해 저장)
+                self.history[obj_id] = {
+                    'dist': curr_dist, 
+                    'time': timestamp, 
+                    'center': center_now,
+                    'label': label
+                }
 
-                # 리스크 점수 산출
-                # 접근 속도(velocity)가 높을수록 점수가 가파르게 상승합니다.
+                # 리스크 점수 (속도가 음수면 멀어지는 것이므로 0 처리)
                 risk = round((10.0 / (curr_dist + 1e-6)) + (max(0, velocity) * 0.7), 4)
-                
-                alert = "NORMAL"
-                if risk >= 2.0: alert = "DANGER"
-                elif risk >= 1.0: alert = "WARNING"
+                alert = "DANGER" if risk >= 2.0 else "WARNING" if risk >= 1.0 else "NORMAL"
 
                 frame_report.append({
                     "id": int(obj_id),
@@ -225,9 +244,7 @@ class DrivingAnalyzer:
                     "alert": alert,
                     "bbox": [x1, y1, x2, y2]
                 })
-        
-        # [중요] 만약 트래커가 ID를 부여하지 못한 '찰나의 객체'가 있다면?
-        # 일단은 무시하거나, 'New'로 띄우되 다음 프레임에서 ID가 생기면 바로 추적에 편입됩니다.
+
         return frame_report
 
 if __name__ == "__main__":
