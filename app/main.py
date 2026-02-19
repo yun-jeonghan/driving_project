@@ -24,11 +24,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RDRDS_Admin")
 
-app = FastAPI(title="RDRDS API", debug=True)
+app = FastAPI(
+    title="RDRDS API", 
+    description="실시간 주행 위험 탐지 시스템 (Visualization 포함)",
+    debug=True
+)
 
-# ---------------------------------------------------------
-# [에러 핸들러]
-# ---------------------------------------------------------
+# [에러 핸들러] 상세 Traceback 반환
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     error_msg = traceback.format_exc()
@@ -38,66 +40,67 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"status": "error", "message": str(exc), "traceback": error_msg}
     )
 
-# 1. 모델 경로 설정 및 분석기 초기화
+# 모델 로드
 BASE_DIR = Path(__file__).resolve().parents[1]
 yolo_p = BASE_DIR / "models" / "yolo26n.pt"
 vggt_p = BASE_DIR / "models" / "model_tracker_fixed_e20.pt"
 
 try:
     analyzer = DrivingAnalyzer(yolo_p, vggt_p)
-    
-    # 🔥 [핵심 수정 사항] FastVGGT의 chunk_size 에러 방지
-    # 모델 내부의 chunk_size가 0이 되지 않도록 강제로 설정합니다.
-    if analyzer and hasattr(analyzer, 'vggt'):
-        # DrivingAnalyzer 내부에 vggt 모델 인스턴스가 있다면 접근
-        try:
-            # 보통 vggt.model.chunk_size 또는 vggt.chunk_size에 위치합니다.
-            # 이 값을 1024 정도로 설정하면 range(0, num, 1024)가 되어 에러가 해결됩니다.
-            if hasattr(analyzer.vggt, 'model'):
-                analyzer.vggt.model.chunk_size = 1024
-            else:
-                analyzer.vggt.chunk_size = 1024
-            logger.info("🛠 FastVGGT chunk_size를 1024로 강제 설정 완료")
-        except Exception as patch_e:
-            logger.warning(f"⚠️ chunk_size 패치 실패 (무시 가능): {patch_e}")
-
-    logger.info("🚀 분석 엔진 로드 완료 (T4 GPU 활성)")
+    logger.info("🚀 분석 엔진 및 시각화 모듈 로드 완료")
 except Exception as e:
     logger.error(f"❌ 엔진 로드 실패:\n{traceback.format_exc()}")
     analyzer = None
 
-# [SRS 6.1] 백그라운드 로깅
 def log_high_risk_event(results: list):
     high_risk_objs = [obj for obj in results if obj['risk'] >= 80.0]
     if high_risk_objs:
-        logger.warning(f"⚠️ HIGH RISK DETECTED: {high_risk_objs}")
+        logger.warning(f"⚠️ HIGH RISK: {high_risk_objs}")
 
+@app.get("/")
+def read_root():
+    return {"status": "online", "engine": "Active" if analyzer else "Inactive"}
+
+# [엔드포인트 1] 데이터 분석 전용
 @app.post("/analyze")
 async def predict_risk(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not analyzer:
-        raise HTTPException(status_code=503, detail="분석 엔진이 준비되지 않았습니다.")
-
+        raise HTTPException(status_code=503, detail="Engine Inactive")
     try:
-        request_content = await file.read()
-        img_pil = Image.open(io.BytesIO(request_content)).convert("RGB")
+        content = await file.read()
+        img_pil = Image.open(io.BytesIO(content)).convert("RGB")
         frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-
         timestamp = datetime.now().timestamp()
         results = analyzer.analyze_frame(frame, timestamp)
-
+        
         is_warning = any(obj['risk'] >= 80.0 for obj in results)
         if is_warning:
             background_tasks.add_task(log_high_risk_event, results)
 
         return JSONResponse(content={
-            "status": "success",
-            "is_warning": is_warning,
-            "timestamp": timestamp,
-            "data": {
-                "detections": results,
-                "object_count": len(results)
-            }
+            "status": "success", "is_warning": is_warning,
+            "data": {"detections": results, "object_count": len(results)}
         })
+    except Exception as e:
+        raise e
+
+# [엔드포인트 2] 시각화 결과 반환 (여기가 404 원인이었음)
+@app.post("/analyze/visualize")
+async def analyze_and_visualize(file: UploadFile = File(...)):
+    if not analyzer:
+        raise HTTPException(status_code=503, detail="Engine Inactive")
+    try:
+        content = await file.read()
+        img_pil = Image.open(io.BytesIO(content)).convert("RGB")
+        frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        
+        # 분석 및 시각화 수행
+        results = analyzer.analyze_frame(frame, datetime.now().timestamp())
+        vis_frame = analyzer.draw_results(frame, results)
+        
+        # PNG 스트리밍 응답
+        _, im_png = cv2.imencode(".png", vis_frame)
+        return StreamingResponse(io.BytesIO(im_png.tobytes()), media_type="image/png")
     except Exception as e:
         raise e
 
