@@ -51,10 +51,29 @@ class FastVGGTHandler:
             state_dict = checkpoint.get('model', checkpoint.get('state_dict', checkpoint))
             self.model.load_state_dict(state_dict, strict=False)
             self.model.to(self.device).eval()
-            print("✅ FastVGGT 모델 로드 완료")
+            
+            # 🔥 [CRITICAL FIX] chunk_size 0 에러 해결을 위한 강제 주입
+            # 모델 인스턴스와 하위 모듈(aggregator 등)에 chunk_size가 0이 되지 않도록 1024를 설정합니다.
+            self._patch_chunk_size(1024)
+            
+            print("✅ FastVGGT 모델 로드 및 chunk_size 패치 완료")
         except Exception as e:
             print(f"❌ FastVGGT 로드 실패: {e}")
             self.model = None
+
+    def _patch_chunk_size(self, value: int):
+        """모델 내부의 모든 chunk_size 관련 속성을 찾아 수정"""
+        if self.model is None:
+            return
+        
+        # 1. 메인 모델 속성 설정
+        self.model.chunk_size = value
+        
+        # 2. 하위 모듈(aggregator 등) 탐색 및 설정
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'chunk_size'):
+                module.chunk_size = value
+                # print(f"DEBUG: Patched chunk_size in {name}")
 
     @torch.no_grad()
     def get_depth_map(self, frame: np.ndarray) -> np.ndarray:
@@ -62,11 +81,12 @@ class FastVGGTHandler:
         if self.model is None:
             return np.ones((frame.shape[0], frame.shape[1])) * 50.0
 
-        # 전처리: 518x392 해상도로 리사이징 (모델 최적화 규격)
+        # 전처리: 518x392 해상도로 리사이징
         img_input = cv2.resize(frame, (518, 392))
         img_tensor = torch.from_numpy(img_input).permute(2, 0, 1).float().to(self.device) / 255.0
         img_tensor = img_tensor.unsqueeze(0)
         
+        # Mixed Precision 사용 (T4 GPU 최적화)
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
             output = self.model(img_tensor)
         
@@ -86,12 +106,12 @@ class DrivingAnalyzer:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.yolo = YOLOHandler(yolo_path)
         self.vggt = FastVGGTHandler(vggt_path, self.device)
-        self.buffer = VideoBuffer(size=5) # [REQ-FUNC-201] 5프레임 슬라이딩 윈도우
-        self.history = {} # 객체별 추적 데이터 저장: {id: {'dist': d, 'time': t}}
+        self.buffer = VideoBuffer(size=5) # 5프레임 슬라이딩 윈도우
+        self.history = {} # 객체별 추적 데이터 저장
 
     def analyze_frame(self, frame: np.ndarray, timestamp: float) -> List[Dict[str, Any]]:
         """[SRS 4.1] 실시간 프레임 분석 및 위험 점수 산출"""
-        self.buffer.push(frame) # 버퍼 업데이트
+        self.buffer.push(frame)
         
         # 1. 객체 탐지 및 추적
         yolo_res = self.yolo.track(frame)
@@ -104,7 +124,6 @@ class DrivingAnalyzer:
         if yolo_res.boxes is not None:
             boxes = yolo_res.boxes.xyxy.cpu().numpy()
             clss = yolo_res.boxes.cls.cpu().numpy().astype(int)
-            # YOLO ID가 없을 경우 -1 할당
             ids = yolo_res.boxes.id.cpu().numpy().astype(int) if yolo_res.boxes.id is not None else [-1] * len(boxes)
 
             for box, obj_id, cls in zip(boxes, ids, clss):
@@ -114,7 +133,7 @@ class DrivingAnalyzer:
                 roi_depth = depth_map_resized[y1:y2, x1:x2]
                 curr_dist = np.mean(roi_depth) if roi_depth.size > 0 else 50.0
                 
-                # [REQ-FUNC-202] 상대 속도 계산: v = (이전 거리 - 현재 거리) / 시간 변화량
+                # 상대 속도 계산
                 velocity = 0.0
                 if obj_id != -1 and obj_id in self.history:
                     prev = self.history[obj_id]
@@ -122,14 +141,11 @@ class DrivingAnalyzer:
                     if delta_t > 0:
                         velocity = (prev['dist'] - curr_dist) / delta_t
                 
-                # [SRS 4.2.2] 위험 점수 산출 (Risk Score Formula)
-                # 점수 = (기준 거리 10m 가중치) + (상대 속도 가중치)
+                # 위험 점수 산출
                 risk_score = min(100.0, (10.0 / (curr_dist + 1e-6)) * 10 + (max(0, velocity) * 15))
-                
-                # [SRS 5.2] 위험 단계 설정 (트리거 기준 80점)
                 alert = "DANGER" if risk_score >= 80.0 else "WARNING" if risk_score >= 50.0 else "NORMAL"
 
-                # 히스토리 업데이트 (ID 추적이 가능할 때만)
+                # 히스토리 업데이트
                 if obj_id != -1:
                     self.history[obj_id] = {'dist': curr_dist, 'time': timestamp}
                 
@@ -145,20 +161,14 @@ class DrivingAnalyzer:
         return frame_report
 
     def draw_results(self, frame: np.ndarray, results: List[Dict]) -> np.ndarray:
-        """[SRS 3.1] 시각적 경고 레이어 오버레이"""
+        """시각적 경고 레이어 오버레이"""
         annotated = frame.copy()
         for res in results:
             x1, y1, x2, y2 = res['bbox']
-            # 위험 등급별 색상 (BGR)
             color = (0, 0, 255) if res['alert'] == "DANGER" else (0, 165, 255) if res['alert'] == "WARNING" else (0, 255, 0)
-            
-            # 바운딩 박스
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            
-            # 정보 라벨링
             label_text = f"ID:{res['id']} {res['dist_m']}m"
             risk_text = f"Risk: {res['risk']}"
             cv2.putText(annotated, label_text, (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             cv2.putText(annotated, risk_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
         return annotated
