@@ -1,66 +1,69 @@
 import requests
 import time
-import os
-import json
+import cv2
+import numpy as np
+import concurrent.futures
 from pathlib import Path
 
-# [설정] 일반 분석과 시각화 주소 구분
-API_URL_DATA = "http://localhost:8000/analyze"
-API_URL_VIS = "http://localhost:8000/analyze/visualize"
-INTERVAL = 0.1 
+API_URL = "http://localhost:8000/analyze/visualize"
+FPS = 10.0
 
-def run_scenario_test(base_dir: str):
-    base_path = Path(base_dir)
-    video_folders = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith("video")])
+def process_scenario(folder_path: Path):
+    scenario_name = folder_path.name
+    print(f"🚀 [Client-{scenario_name}] 시작")
     
-    if not video_folders:
-        print(f"❌ '{base_dir}' 내에 테스트 폴더가 없습니다.")
-        return
+    images = sorted(folder_path.glob("*.jpg"), key=lambda x: x.name)
+    if not images: return
 
-    # 결과 저장을 위한 폴더 생성
-    output_root = Path("runs/visualize")
-    output_root.mkdir(parents=True, exist_ok=True)
+    # 첫 프레임으로 비디오 사이즈 결정
+    sample_img = cv2.imread(str(images[0]))
+    h, w, _ = sample_img.shape
+    
+    # 비디오 라이터 설정
+    output_path = f"runs/{scenario_name}_result.mp4"
+    os.makedirs("runs", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, FPS, (w, h))
 
-    for folder in video_folders:
-        print(f"\n🎬 시나리오 시각화 테스트: {folder.name}")
-        print("-" * 60)
-        
-        # 결과 저장 하위 폴더
-        save_dir = output_root / folder.name
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        images = sorted(folder.glob("*.jpg"), key=lambda x: x.name)
-        
-        for i, img_p in enumerate(images):
-            start_time = time.time()
+    for i, img_p in enumerate(images):
+        start_time = time.time()
+        try:
+            with open(img_p, "rb") as f:
+                resp = requests.post(API_URL, files={"file": f})
             
-            try:
-                # 1. 시각화 엔드포인트 호출 (StreamingResponse로 이미지를 받아옴)
-                with open(img_p, "rb") as f:
-                    response = requests.post(API_URL_VIS, files={"file": f})
+            if resp.status_code == 200:
+                # 바이너리 이미지를 numpy 배열로 변환
+                nparr = np.frombuffer(resp.content, np.uint8)
+                res_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                out.write(res_frame)
                 
                 latency = (time.time() - start_time) * 1000
-                
-                if response.status_code == 200:
-                    # 2. 결과 이미지 저장
-                    save_path = save_dir / f"res_{img_p.name}"
-                    with open(save_path, "wb") as out_f:
-                        out_f.write(response.content)
-                    
-                    status = "✅" if latency <= 150 else "⚠️ SLOW"
-                    print(f"[{folder.name}] Frame {i+1:<3} | {latency:6.1f}ms | {status} | Saved: {save_path.name}")
-                else:
-                    print(f"❌ 에러 발생 ({img_p.name}): {response.status_code}")
-                    print(response.text)
-
-            except Exception as e:
-                print(f"🔌 통신 실패: {e}")
-                return
-
-            # 속도 조절
-            time.sleep(max(0, INTERVAL - (time.time() - start_time)))
+                print(f"[{scenario_name}] Frame {i+1:<3} | Latency: {latency:6.1f}ms")
+            else:
+                print(f"❌ [{scenario_name}] Error: {resp.status_code}")
+        except Exception as e:
+            print(f"🔌 [{scenario_name}] Connection Fail: {e}")
         
-        print(f"🏁 {folder.name} 시나리오 종료 (저장 완료: {save_dir})")
+        # 10 FPS 보정
+        time.sleep(max(0, (1/FPS) - (time.time() - start_time)))
+
+    out.release()
+    print(f"🏁 [Client-{scenario_name}] 완료 -> {output_path}")
+
+def run_concurrent_test(base_dir: str, num_clients: int = 3):
+    """
+    여러 시나리오 폴더를 동시에 실행하여 비동기 대응 능력을 확인합니다.
+    """
+    base_path = Path(base_dir)
+    # 테스트할 폴더들 (video1, video2 등)
+    video_folders = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith("video")])[:num_clients]
+
+    print(f"🔥 {len(video_folders)}개의 클라이언트가 동시에 요청을 보냅니다...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(video_folders)) as executor:
+        executor.map(process_scenario, video_folders)
 
 if __name__ == "__main__":
-    run_scenario_test("tests")
+    import os
+    # 시나리오가 1개뿐이라면 동일 폴더를 여러 번 호출하도록 수정 가능
+    run_concurrent_test("tests", num_clients=2)
