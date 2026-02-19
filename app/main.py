@@ -1,76 +1,126 @@
 import os
 import io
-import logging
-import uuid
 import cv2
+import logging
 import numpy as np
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from PIL import Image
 from pathlib import Path
+from PIL import Image
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse
 from app.core.analyzer import DrivingAnalyzer
 
-# [SRS 6.1] 시스템 관리자 로그 설정
-logging.basicConfig(filename='admin_monitor.log', level=logging.INFO)
+# [SRS 6.1] 시스템 관리자용 고위험 상황 로깅 설정
+# 관리자 콘솔에서 실시간으로 확인할 수 있도록 로그 파일에 기록합니다.
+logging.basicConfig(
+    filename='admin_monitor.log', 
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("RDRDS_Admin")
 
-app = FastAPI(title="RDRDS API", description="[SRS 1.1] 실시간 주행 위험 탐지 시스템")
+app = FastAPI(
+    title="RDRDS API", 
+    description="[SRS 1.1] FastAPI 기반 실시간 주행 위험 탐지 시스템"
+)
 
-# 모델 초기화
+# 1. 모델 경로 설정 및 분석기 초기화
 BASE_DIR = Path(__file__).resolve().parents[1]
 yolo_p = BASE_DIR / "models" / "yolo26n.pt"
 vggt_p = BASE_DIR / "models" / "model_tracker_fixed_e20.pt"
 
+# 서버 시작 시 모델을 메모리에 올립니다.
 try:
     analyzer = DrivingAnalyzer(yolo_p, vggt_p)
-    logger.info("Analysis Engine successfully loaded on T4 GPU.")
+    logger.info("🚀 분석 엔진 로드 완료 (T4 GPU 활성)")
 except Exception as e:
-    logger.error(f"Engine Load Failed: {e}")
+    # [SRS 5.2] 엔진 로드 실패 시 관리자에게 알리고 예외 처리
+    logger.error(f"❌ 엔진 로드 실패: {e}")
     analyzer = None
 
+# [SRS 6.1] 고위험 상황 발생 시 백그라운드 로깅 함수
+def log_high_risk_event(results: list):
+    high_risk_objs = [obj for obj in results if obj['risk'] >= 80.0]
+    if high_risk_objs:
+        logger.warning(f"⚠️ HIGH RISK DETECTED: {high_risk_objs}")
+
+@app.get("/")
+def read_root():
+    """시스템 상태 확인 엔드포인트"""
+    return {
+        "status": "online", 
+        "engine": "Active" if analyzer else "Inactive",
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.post("/analyze")
-async def predict_risk(file: UploadFile = File(...)):
-    """[SRS 3.3] 단일 프레임 분석 엔드포인트"""
+async def predict_risk(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    [SRS 3.3] 실시간 프레임 분석 엔드포인트
+    - 비동기 파일 읽기를 통해 I/O 지연을 최소화합니다.
+    - 분석 결과와 함께 경고 트리거 여부를 반환합니다.
+    """
     if not analyzer:
-        raise HTTPException(status_code=503, detail="Engine Inactive")
+        raise HTTPException(status_code=503, detail="분석 엔진이 준비되지 않았습니다.")
 
     try:
-        data = await file.read()
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        
+        # 2. 업로드된 이미지 처리 (Multipart/form-data)
+        request_content = await file.read()
+        img_pil = Image.open(io.BytesIO(request_content)).convert("RGB")
+        frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+        # 3. 분석 수행 (Orchestrator 호출)
         timestamp = datetime.now().timestamp()
         results = analyzer.analyze_frame(frame, timestamp)
-        
-        # [SRS 5.2] 위험 발생 시 트리거 (Trigger)
+
+        # 4. [SRS 4.4] 위험 감지 시 트리거 판단
+        # 최고 위험 점수가 80점 이상일 경우 경고 상태로 간주합니다.
         is_warning = any(obj['risk'] >= 80.0 for obj in results)
+        
+        # 5. [SRS 6.1] 고위험 로그는 응답 속도에 영향을 주지 않도록 백그라운드 처리
         if is_warning:
-            logger.warning(f"HIGH RISK EVENT: {results}")
+            background_tasks.add_task(log_high_risk_event, results)
 
         return JSONResponse(content={
             "status": "success",
-            "is_warning": is_warning,
-            "max_risk": max([obj['risk'] for obj in results]) if results else 0,
-            "detections": results
+            "is_warning": is_warning, # 클라이언트 UI 점멸 트리거용
+            "timestamp": timestamp,
+            "data": {
+                "detections": results,
+                "object_count": len(results)
+            }
         })
     except Exception as e:
-        logger.error(f"Inference Error: {e}")
-        return {"status": "error", "message": "Handle Inference Failure"}
+        logger.error(f"Inference Error: {str(e)}")
+        return JSONResponse(
+            status_code=500, 
+            content={"status": "error", "message": "Handle Inference Failure"}
+        )
 
 @app.post("/analyze/visualize")
-async def analyze_visualize(file: UploadFile = File(...)):
-    """[SRS 3.1] 시각화 결과 직접 반환"""
+async def analyze_and_visualize(file: UploadFile = File(...)):
+    """
+    [SRS 3.1] 시각화 결과 반환 엔드포인트
+    - 분석된 객체와 위험도가 그려진 이미지를 직접 반환합니다.
+    """
+    if not analyzer:
+        raise HTTPException(status_code=503, detail="Engine Inactive")
+
     data = await file.read()
-    img = Image.open(io.BytesIO(data)).convert("RGB")
-    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    img_pil = Image.open(io.BytesIO(data)).convert("RGB")
+    frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     
     results = analyzer.analyze_frame(frame, datetime.now().timestamp())
+    
+    # [SRS 3.1] 시각적 경고 레이어 합성
     vis_frame = analyzer.draw_results(frame, results)
     
+    # 결과를 PNG 포맷으로 인코딩하여 스트리밍 반환
     _, im_png = cv2.imencode(".png", vis_frame)
     return StreamingResponse(io.BytesIO(im_png.tobytes()), media_type="image/png")
 
 if __name__ == "__main__":
     import uvicorn
+    # [SRS 2.4] 서버 구동 설정
     uvicorn.run(app, host="0.0.0.0", port=8000)
