@@ -49,9 +49,15 @@ class FastVGGTHandler:
     def get_depth_map(self, frame: np.ndarray) -> np.ndarray:
         img_input = cv2.resize(frame, (518, 392))
         img_tensor = torch.from_numpy(img_input).permute(2, 0, 1).float().to(self.device) / 255.0
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-            #output = self.model(img_tensor.unsqueeze(0))
-            output = self.model(img_tensor.unsqueeze(0).float())
+        # [핵심] Autocast를 명시적으로 끄고, 모든 연산을 Float32로 강제함
+        with torch.cuda.amp.autocast(enabled=False):
+            with torch.no_grad():
+                # 입력 텐서와 모델을 모두 float32로 통일
+                input_tensor = img_tensor.unsqueeze(0).to(self.device).float()
+                self.model.to(self.device).float() 
+                
+                output = self.model(input_tensor)
+                
         depth = output.get('depth', list(output.values())[0]) if isinstance(output, dict) else output
         return depth.squeeze().float().cpu().numpy()
 
