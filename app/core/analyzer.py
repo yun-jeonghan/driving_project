@@ -50,7 +50,8 @@ class FastVGGTHandler:
         img_input = cv2.resize(frame, (518, 392))
         img_tensor = torch.from_numpy(img_input).permute(2, 0, 1).float().to(self.device) / 255.0
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-            output = self.model(img_tensor.unsqueeze(0))
+            #output = self.model(img_tensor.unsqueeze(0))
+            output = self.model(img_tensor.unsqueeze(0).float())
         depth = output.get('depth', list(output.values())[0]) if isinstance(output, dict) else output
         return depth.squeeze().float().cpu().numpy()
 
