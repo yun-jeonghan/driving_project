@@ -106,3 +106,39 @@ class DrivingAnalyzer:
             cv2.putText(annotated, label, (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             cv2.putText(annotated, f"Risk: {res['risk']}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         return annotated
+
+    import cv2
+    import numpy as np
+
+    def draw_results_with_dashboard(self, frame, results):
+        h, w, _ = frame.shape
+        dashboard_h = 150 # 하단 대시보드 높이
+        
+        # 1. 하단 블랙 캔버스 확장 (SRS 3.1 반영)
+        canvas = cv2.copyMakeBorder(frame, 0, dashboard_h, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+        
+        # 가장 높은 위험 점수 추출
+        max_risk = max([obj['risk'] for obj in results]) if results else 0.0
+        fps = 10.0 # 예시 FPS
+        
+        # 2. 다이내믹 위험 게이지 (Semi-circular 대신 바 형태로 간소화 구현)
+        gauge_width = int((w - 100) * (max_risk / 100))
+        gauge_color = (0, 0, 255) if max_risk >= 80 else (0, 255, 0)
+        cv2.rectangle(canvas, (50, h + 40), (50 + gauge_width, h + 70), gauge_color, -1)
+        cv2.rectangle(canvas, (50, h + 40), (w - 50, h + 70), (255, 255, 255), 2) # 테두리
+        
+        # 3. 텍스트 정보 표기 (HUD 스타일)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(canvas, f"RISK SCORE: {max_risk:.1f}", (50, h + 110), font, 0.8, (255, 255, 255), 2)
+        cv2.putText(canvas, f"SYSTEM FPS: {fps}", (w - 250, h + 110), font, 0.7, (0, 255, 255), 2)
+
+        # 4. 고위험 시 적색 점멸 및 경고 문구 (SRS 3.1: IMMEDIATE BRAKE)
+        if max_risk >= 80:
+            # 화면 전체 적색 오버레이 (점멸 효과는 프레임 수에 따라 조절 가능)
+            overlay = canvas.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1)
+            canvas = cv2.addWeighted(overlay, 0.3, canvas, 0.7, 0)
+            
+            cv2.putText(canvas, "!!! IMMEDIATE BRAKE !!!", (w//2 - 200, h + 90), font, 1.2, (0, 0, 255), 4)
+
+        return canvas

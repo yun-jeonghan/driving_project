@@ -64,6 +64,20 @@ def log_high_risk_event(results: list):
     if high_risk_objs:
         logger.warning(f"⚠️ HIGH RISK DETECTED: {high_risk_objs}")
 
+from pynvml import *
+
+def get_gpu_status():
+    try:
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0) # T4 GPU
+        info = nvmlDeviceGetMemoryInfo(handle)
+        used_vram = info.used / 1024**2 # MB 단위
+        total_vram = info.total / 1024**2
+        util = nvmlDeviceGetUtilizationRates(handle).gpu
+        return f"VRAM: {used_vram:.0f}/{total_vram:.0f}MB ({used_vram/total_vram*100:.1f}%) | GPU Util: {util}%"
+    except:
+        return "GPU Monitoring Failed"
+
 @app.get("/")
 def read_root():
     """시스템 상태 확인 엔드포인트"""
@@ -132,6 +146,12 @@ async def analyze_and_visualize(file: UploadFile = File(...)):
         
         # 결과를 PNG 포맷으로 인코딩하여 스트리밍 반환
         _, im_png = cv2.imencode(".png", vis_frame)
+
+        # 관리자 콘솔 출력 (sys.stdout.write로 한 줄 갱신 효과)
+        gpu_log = get_gpu_status()
+        sys.stdout.write(f"\r[ADMIN CONSOLE] {gpu_log} | Processing Frame...")
+        sys.stdout.flush()
+
         return StreamingResponse(io.BytesIO(im_png.tobytes()), media_type="image/png")
     except Exception as e:
         raise e
